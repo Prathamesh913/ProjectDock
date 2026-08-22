@@ -1,0 +1,35 @@
+# ProjectDock configuration (example)
+#
+# Copy to ~/.config/projectdock/config.toml and edit. All values shown are
+# the defaults; only existing directories listed in `roots` are scanned.
+#
+# roots: directories scanned for projects (relative paths in ~ allowed).
+#        Only existing directories are scanned.
+# editor: command used by the default open action. Leave empty to use
+#         Omarchy's default editor (omarchy-launch-editor).
+# terminal: command used to open a terminal in the project. Leave empty to
+#         use xdg-terminal-exec (respects the Omarchy default). Use {dir}
+#         as a placeholder for the project path.
+# file_manager: command used to open the project folder. Leave empty to
+#         use xdg-open. Use {dir} as a placeholder for the project path.
+# theme: 'auto' follows the active Omarchy theme. You may also set a fixed
+#         stock theme name (e.g. 'vantablack', 'catppuccin').
+# hide_on_focus_loss: when true (default), the launcher closes if it loses
+#         focus (e.g. clicking another window). Set false to keep it open.
+
+[general]
+roots = ["~/Projects", "~/Code", "~/Development"]
+max_depth = 4
+rescan_minutes = 5
+
+[open]
+editor = ""
+terminal = ""
+file_manager = ""
+
+[ui]
+width = 720
+max_height_pct = 70
+top_margin_pct = 14
+theme = "auto"
+hide_on_focus_loss = false

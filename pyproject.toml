@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "projectdock"
+version = "0.1.0"
+description = "A fast, keyboard-first project launcher for Omarchy and Hyprland"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+projectdock = "projectdock.cli:main"
+
+[tool.setuptools]
+packages = ["projectdock"]
