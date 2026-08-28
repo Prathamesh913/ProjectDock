@@ -26,10 +26,13 @@ except (ValueError, ImportError):
     HAS_LAYER_SHELL = False
 
 from . import cover as _cover
+from . import creation as _creation
 from . import gitinfo
+from . import tools as _tools
 
 MODE_SEARCH = 0
 MODE_ACTIONS = 1
+MODE_PICKER = 2
 
 ICONS = {
     "open": "\U000f0174",      # mdi-code_tags  <>  (coherent MDI family, verified JetBrainsMono Nerd Font)
@@ -43,6 +46,8 @@ ICONS = {
     "config": "\U000f0493",    # mdi-cog  (verified)
     "focus": "\U000f01a3",     # mdi-crosshairs  focus window
     "int": "\U000f040a",       # intelligence dev/test/build – same as run
+    "openwith": "\U000f0423",  # mdi-launch  arrow-out-of-box (verified)
+    "agent": "\U000f06a9",     # mdi-robot  AI coding agent (verified)
 }
 
 MAX_VISIBLE = 400
@@ -137,12 +142,16 @@ class LauncherWindow(Gtk.Window):
         self._git_timeout = None
         self._last_project = None
         self._cover_cache = {}
+        self._picker_project = None
+        self._picker_filter = "all"
 
         self.add_css_class("dock")
         self.set_resizable(False)
         self.connect("close-request", self._on_close_request)
         self.connect("map", self._on_map)
         self.connect("destroy", self._on_destroyed)
+        self._monitors = []
+        self._monitor_debounce = None
 
         self._build_ui()
         self._apply_css(css)
@@ -252,6 +261,7 @@ class LauncherWindow(Gtk.Window):
     def _on_destroyed(self, *args):
         _trace("destroy: window destroyed")
         self._cancel_git_timeout()
+        self._stop_monitors()
 
     def _metrics(self):
         try:
@@ -272,6 +282,9 @@ class LauncherWindow(Gtk.Window):
         self.entry.set_text("")
         self._resetting = False
         self.set_mode(MODE_SEARCH)
+        # Lightweight root signature check when showing: if roots changed or mtime out-of-date, rescan will be triggered via controller._maybe_rescan
+        # Also start directory monitors while visible
+        self._start_monitors()
         self.rebuild()
         self.present()
         GLib.idle_add(self._grab_entry)
@@ -283,6 +296,7 @@ class LauncherWindow(Gtk.Window):
     def hide_dock(self):
         _trace("hide_dock: called (esc/toggle)")
         self._cancel_git_timeout()
+        self._stop_monitors()
         self.controller.hide_window()
 
     def _on_close_request(self, *args):
@@ -302,7 +316,11 @@ class LauncherWindow(Gtk.Window):
             self.search_row.set_visible(False)
             self.title_label.set_visible(True)
             name = self._last_project["name"] if self._last_project else ""
-            self.title_label.set_label(f"{name} \u2014 Actions")
+            if mode == MODE_PICKER:
+                suffix = "Choose Editor" if getattr(self, "_picker_filter", "all") == "editor" else "Open With"
+            else:
+                suffix = "Actions"
+            self.title_label.set_label(f"{name} \u2014 {suffix}")
 
     # ------------------------------------------------------------- rebuild
 
@@ -311,20 +329,87 @@ class LauncherWindow(Gtk.Window):
         self.listbox.remove_all()
         if self.mode == MODE_ACTIONS:
             self._build_action_rows(self._last_project)
+        elif self.mode == MODE_PICKER:
+            filt = getattr(self, "_picker_filter", "all")
+            self._build_action_rows(self._picker_project, picker=True, picker_filter=filt)
         else:
             self._build_project_rows(self.entry.get_text().strip())
         self._select_first()
         self._update_footer()
         self._schedule_git_for_selected()
 
+    def _should_offer_create(self, query, projects):
+        try:
+            return _creation.should_offer_create(query, projects)
+        except Exception:
+            return False
+
+    def _create_row(self, query):
+        row = Gtk.ListBoxRow(activatable=True)
+        row.add_css_class("project-row")
+        row.add_css_class("create-row")
+        row.is_create = True
+        row.create_query = query.strip()
+        # target root hint
+        try:
+            roots = self.controller.cfg.expanded_roots()
+            active = None
+            try:
+                if self._last_project:
+                    active = self._last_project.get("path")
+            except Exception:
+                pass
+            target_root = _creation.choose_target_root(roots, active)
+        except Exception:
+            target_root = None
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox.set_valign(Gtk.Align.CENTER)
+        # plus icon
+        plus = Gtk.Label(label="\u002b")
+        plus.add_css_class("action-icon")
+        plus.set_size_request(26, -1)
+        plus.set_xalign(0.5)
+        hbox.append(plus)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        vbox.set_hexpand(True)
+        # Use markup to show query safely
+        esc = _escape(query.strip())
+        label = Gtk.Label(label=f'Create "{esc}"', xalign=0, use_markup=False)
+        label.add_css_class("project-name")
+        label.set_xalign(0.0)
+        label.set_hexpand(True)
+        vbox.append(label)
+        if target_root:
+            # shorten path like _short_path
+            sub = Gtk.Label(label=_short_path(target_root), xalign=0)
+            sub.add_css_class("project-path")
+            sub.set_xalign(0.0)
+            vbox.append(sub)
+        hbox.append(vbox)
+        # subtle hint
+        hint = Gtk.Label(label="\u21b5")
+        hint.add_css_class("action-hint")
+        hint.set_valign(Gtk.Align.CENTER)
+        hbox.append(hint)
+        row.set_child(hbox)
+        return row
+
     def _build_project_rows(self, query):
         projects = self.controller.projects_for_query(query)
+        offer_create = self._should_offer_create(query, self.controller.state.projects if hasattr(self.controller.state, "projects") else projects)
         if not projects:
             self._build_empty_rows(query)
+            if offer_create:
+                self.listbox.append(self._create_row(query))
+            self._append_rescan_utility_row(query)
             return
         if query:
             for project in projects[:MAX_VISIBLE]:
                 self.listbox.append(self._project_row(project))
+            if offer_create:
+                # place create row after existing matches (does not dominate)
+                self.listbox.append(self._create_row(query))
+            self._append_rescan_utility_row(query)
             return
         # Precedence: Pinned → Active → Recent → Projects (no duplication)
         pinned = [p for p in projects if p.get("pinned")]
@@ -350,6 +435,12 @@ class LauncherWindow(Gtk.Window):
                 self.listbox.append(self._header_row("Projects"))
             for project in rest[:MAX_VISIBLE]:
                 self.listbox.append(self._project_row(project))
+        # Rescan utility row only when search query is empty: a discovery
+        # action is not a project and should not appear alongside filtered
+        # results. This row is NOT a project and uses an internal
+        # representation (`is_rescan`) so it never collides with project
+        # selection logic (open_default, smart primary, etc).
+        self._append_rescan_utility_row(query)
 
     def _build_empty_rows(self, query):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
@@ -382,6 +473,78 @@ class LauncherWindow(Gtk.Window):
         hbox.append(label)
         row.set_child(hbox)
         self.listbox.append(row)
+
+    def _rescan_utility_row(self, kind="all", label="Rescan projects"):
+        """Build a non-project utility row for the search mode.
+
+        This row is visually secondary to project results but uses the same
+        flat row language. It carries an explicit `is_rescan` flag so the
+        rest of the UI (project selection, smart primary, open_default) is
+        guaranteed never to confuse it with a real project.
+        """
+        row = Gtk.ListBoxRow(activatable=True)
+        row.add_css_class("project-row")
+        row.add_css_class("rescan-row")
+        row.is_rescan = True
+        row.rescan_kind = kind
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox.set_valign(Gtk.Align.CENTER)
+        icon = Gtk.Label(label=ICONS["refresh"])
+        icon.add_css_class("action-icon")
+        icon.set_halign(Gtk.Align.CENTER)
+        icon.set_valign(Gtk.Align.CENTER)
+        icon.set_size_request(18, -1)
+        icon.set_xalign(0.5)
+        hbox.append(icon)
+        label_w = Gtk.Label(label=label, xalign=0)
+        label_w.add_css_class("action-label")
+        label_w.set_valign(Gtk.Align.CENTER)
+        hbox.append(label_w)
+        hbox.append(Gtk.Box(hexpand=True))
+        hint = Gtk.Label(label="\u21b5")
+        hint.add_css_class("action-hint")
+        hint.set_valign(Gtk.Align.CENTER)
+        hint.set_xalign(1.0)
+        hbox.append(hint)
+        row.set_child(hbox)
+        return row
+
+    def _append_rescan_utility_row(self, query):
+        """Append the Rescan utility row when it is appropriate to do so.
+
+        It is shown only in the main search mode and only when the query is
+        empty. A discovery / rescan action is meaningless when the user is
+        filtering for a specific project name, so the row disappears as
+        soon as they start typing.
+        """
+        if query:
+            return
+        # Subtle separator so the utility row does not look like another
+        # project. Header text is intentionally lowercase / minimal so it
+        # reads as a utility, not a section of projects.
+        sep = Gtk.ListBoxRow()
+        sep.set_selectable(False)
+        sep.set_activatable(False)
+        sep.add_css_class("rescan-separator")
+        label = Gtk.Label(label="", xalign=0)
+        label.set_size_request(-1, 1)
+        sep.set_child(label)
+        self.listbox.append(sep)
+        # Prefer targeted root rescan when the previously selected project
+        # is known and belongs to a configured root, otherwise global.
+        kind = "all"
+        label_text = "Rescan projects"
+        try:
+            last = getattr(self, "_last_project", None)
+            if last:
+                root = self.controller._root_for_path(last.get("path", ""))
+                if root:
+                    kind = "root"
+                    base = os.path.basename(root) or root
+                    label_text = f"Rescan {base}"
+        except Exception:
+            pass
+        self.listbox.append(self._rescan_utility_row(kind=kind, label=label_text))
 
     def _cover_widget(self, project):
         """Compact square project identity: artwork when found, else initials.
@@ -547,11 +710,25 @@ class LauncherWindow(Gtk.Window):
         row.git_badge = git_badge
         return row
 
-    def _build_action_rows(self, project):
+    def _build_action_rows(self, project, picker=False, picker_filter="all"):
         if not project:
             self._build_empty_rows("")
             return
-        rows = self.controller.actions_for(project)
+        if picker:
+            if picker_filter == "editor":
+                # Use explicit editor picker with preferred hint
+                try:
+                    rows = self.controller.choose_editor_rows(project)
+                    if not rows:
+                        rows = self.controller.editor_picker_rows()
+                    if not rows:
+                        rows = self.controller.picker_rows()
+                except Exception:
+                    rows = self.controller.picker_rows()
+            else:
+                rows = self.controller.picker_rows()
+        else:
+            rows = self.controller.actions_for(project)
         for action_id, label, sub, hint in rows:
             if action_id.startswith("header:"):
                 # subtle section header, not selectable
@@ -560,11 +737,23 @@ class LauncherWindow(Gtk.Window):
             row = Gtk.ListBoxRow(activatable=True)
             row.add_css_class("project-row")
             row.add_css_class("action-row")
-            row.action = (action_id, project)
             hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             hbox.set_valign(Gtk.Align.CENTER)
             icon_key = action_id.split(":", 1)[0]
-            glyph = ICONS.get(icon_key, ICONS["open"])
+            glyph = ICONS.get(icon_key)
+            if picker and action_id.startswith("tool:"):
+                tool_id = action_id.split(":", 1)[1]
+                from . import tools as _tools
+                tool = _tools.get_tool(tool_id)
+                row.tool_id = tool_id
+                glyph = ICONS.get(
+                    "agent" if tool is not None and tool.kind == "agent"
+                    else "open")
+                row.action = (action_id, project)
+            else:
+                row.action = (action_id, project)
+                if glyph is None:
+                    glyph = ICONS["open"]
             icon = Gtk.Label(label=glyph)
             icon.add_css_class("action-icon")
             icon.set_halign(Gtk.Align.CENTER)
@@ -627,7 +816,17 @@ class LauncherWindow(Gtk.Window):
         self.hint_left.set_markup(
             f'{key("\u2191\u2193")} navigate \u00b7 {key("\u21b5")} open \u00b7 '
             f'{key("tab")} actions \u00b7 {key("esc")} close')
-        if self.controller.scanning:
+        # Status message (e.g. "Rescanning projects…" / "Projects updated")
+        # has priority over the plain "rescanning…" indicator. The status
+        # message is owned by the controller and can auto-clear.
+        status_text = ""
+        try:
+            status_text = self.controller.status_message() or ""
+        except Exception:
+            status_text = ""
+        if status_text:
+            self.hint_right.set_text(status_text)
+        elif self.controller.scanning:
             self.hint_right.set_text("rescanning\u2026")
         else:
             self.hint_right.set_text("")
@@ -641,6 +840,15 @@ class LauncherWindow(Gtk.Window):
             self.rebuild()
 
     def _on_row_activated(self, listbox, row):
+        if self.mode == MODE_PICKER:
+            tool_id = getattr(row, "tool_id", None)
+            project = self._picker_project
+            if not tool_id or not project:
+                return
+            if not self.controller.launch_tool(project, tool_id):
+                return
+            self.hide_dock()
+            return
         if self.mode == MODE_ACTIONS:
             action = getattr(row, "action", None)
             if not action:
@@ -651,15 +859,92 @@ class LauncherWindow(Gtk.Window):
                 self.rebuild()
                 self._restore_selection(project["path"])
                 return
-            if action_id == "rescan":
-                self.controller.rescan()
-                self._update_footer()
-                return
             if action_id == "config":
                 self.controller.open_config()
                 return
+            if action_id == "choose_editor":
+                self._picker_project = project
+                self._picker_filter = "editor"
+                # ensure _last_project is set for title
+                self._last_project = project
+                self.set_mode(MODE_PICKER)
+                self.rebuild()
+                self.listbox.grab_focus()
+                return
+            if action_id == "openwith":
+                self._picker_project = project
+                self._picker_filter = "all"
+                self._last_project = project
+                self.set_mode(MODE_PICKER)
+                self.rebuild()
+                self.listbox.grab_focus()
+                return
+            # Session actions need no hide (stop/restart keep window for feedback)
+            if action_id in ("stop_dev", "restart_dev"):
+                self.controller.run_action(action_id, project)
+                self.rebuild()
+                self._update_footer()
+                return
+            if action_id == "session_info":
+                return
+            # Defensive: rescan_* actions are not in the actions menu anymore.
+            # If something stale still produces one, route to global rescan.
+            if action_id in ("rescan", "rescan_project", "rescan_root", "rescan_all"):
+                self.controller.rescan_all()
+                self._update_footer()
+                return
             self.controller.run_action(action_id, project)
-            self.hide_dock()
+            # Session actions keep window; hide only for launch actions
+            if action_id not in ("pin", "stop_dev", "restart_dev", "session_info"):
+                self.hide_dock()
+            else:
+                self.rebuild()
+                self._update_footer()
+            return
+        # MODE_SEARCH: handle creation row first
+        if getattr(row, "is_create", False):
+            query = getattr(row, "create_query", "") or self.entry.get_text().strip()
+            # race: if exact project appeared between typing and enter, just open it
+            # Check if query now matches existing project exactly
+            try:
+                from . import creation as _cre
+                if _cre.is_exact_match(query, self.controller.state.projects):
+                    # find exact match and open it
+                    for p in self.controller.state.projects:
+                        if query.strip().lower() in (p.get("name","").lower(), p.get("path","").lower(), p.get("name","").lower()):
+                            # fallback: open first matching via filter
+                            pass
+                    # just rebuild and select? For now, create will handle duplicate as success
+            except Exception:
+                pass
+            proj, err = self.controller.create_project_from_query(query)
+            if proj is None:
+                # creation failed: stay in search, maybe show footer error
+                self._update_footer()
+                return
+            # Immediately enter Actions mode for new project (frictionless)
+            self._last_project = proj
+            self.set_mode(MODE_ACTIONS)
+            self.rebuild()
+            self.listbox.grab_focus()
+            return
+        # Rescan utility row (search mode only, when query is empty)
+        if getattr(row, "is_rescan", False):
+            rescan_kind = getattr(row, "rescan_kind", "all") or "all"
+            if rescan_kind == "root" and self._last_project:
+                root = self.controller._root_for_path(self._last_project.get("path", ""))
+                if root:
+                    self.controller.rescan_root(root)
+                else:
+                    self.controller.rescan_all()
+            else:
+                self.controller.rescan_all()
+            self._update_footer()
+            return
+        # handle config row in empty state
+        action = getattr(row, "action", None)
+        if action and action[0] == "config":
+            self.controller.open_config()
             return
         project = getattr(row, "project", None)
         if project:
@@ -701,6 +986,75 @@ class LauncherWindow(Gtk.Window):
         if self._git_timeout is not None:
             GLib.source_remove(self._git_timeout)
             self._git_timeout = None
+
+    # ------------------------------------------------------------- monitors
+    def _start_monitors(self):
+        self._stop_monitors()
+        try:
+            from gi.repository import Gio
+            roots = self.controller.cfg.expanded_roots()
+            for root in roots[:3]:  # limit to avoid explosion
+                try:
+                    gfile = Gio.File.new_for_path(root)
+                    mon = gfile.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+                    # debounce burst
+                    mon.connect("changed", self._on_dir_changed)
+                    self._monitors.append(mon)
+                except Exception:
+                    continue
+        except Exception:
+            self._monitors = []
+
+    def _stop_monitors(self):
+        for mon in getattr(self, "_monitors", []):
+            try:
+                mon.cancel()
+            except Exception:
+                pass
+        self._monitors = []
+        if self._monitor_debounce is not None:
+            try:
+                GLib.source_remove(self._monitor_debounce)
+            except Exception:
+                pass
+            self._monitor_debounce = None
+
+    def _on_dir_changed(self, *args):
+        # debounce 500ms bursts; coalesce monitor and manual rescans so
+        # they do not produce overlapping work or a feedback flicker.
+        if self._monitor_debounce is not None:
+            try:
+                GLib.source_remove(self._monitor_debounce)
+            except Exception:
+                pass
+        def do_refresh():
+            self._monitor_debounce = None
+            # only refresh while visible and in search mode
+            if self.mode != MODE_SEARCH:
+                return GLib.SOURCE_REMOVE
+            if not self.get_visible():
+                return GLib.SOURCE_REMOVE
+            # If a scan is already in progress (manual or monitor), let
+            # it finish; the rebuild at the end of the scan will pick up
+            # the new state. This avoids a feedback loop where the
+            # monitor's own rescan triggers more filesystem changes.
+            try:
+                if self.controller.scanning:
+                    return GLib.SOURCE_REMOVE
+            except Exception:
+                pass
+            try:
+                from . import discovery as _disc
+                roots = self.controller.cfg.expanded_roots()
+                if _disc.roots_changed(roots, self.controller.state.root_mtimes):
+                    self.controller.rescan_all()
+                else:
+                    # still rebuild to catch any new generic empty project without mtime change? fallback
+                    self.rebuild()
+            except Exception:
+                pass
+            return GLib.SOURCE_REMOVE
+        self._monitor_debounce = GLib.timeout_add(500, do_refresh)
 
     def _spawn_git_fetch(self, path, badge):
         def work():
@@ -769,7 +1123,12 @@ class LauncherWindow(Gtk.Window):
         action = key_action(keyval, state, self.mode)
 
         if action == "escape":
-            if self.mode == MODE_ACTIONS:
+            if self.mode == MODE_PICKER:
+                # back to the Actions menu the picker was opened from
+                self.set_mode(MODE_ACTIONS)
+                self.rebuild()
+                self.listbox.grab_focus()
+            elif self.mode == MODE_ACTIONS:
                 self.set_mode(MODE_SEARCH)
                 self.rebuild()
                 self.entry.grab_focus()
@@ -797,8 +1156,10 @@ class LauncherWindow(Gtk.Window):
             return True
 
         if action == "ctrl:p" or action == "ctrl:t" or action == "ctrl:f" \
-                or action == "ctrl:c" or action == "ctrl:r" or action == "ctrl:j" \
-                or action == "ctrl:k" or action == "ctrl:n" or action == "ctrl:q":
+                or action == "ctrl:c" or action == "ctrl:r" or action == "ctrl:R" \
+                or action == "ctrl:j" or action == "ctrl:k" or action == "ctrl:n" or action == "ctrl:q" \
+                or action == "ctrl:P" or action == "ctrl:T" or action == "ctrl:F" or action == "ctrl:C" \
+                or action == "ctrl:J" or action == "ctrl:K" or action == "ctrl:N" or action == "ctrl:Q":
             return self._on_ctrl(keyval)
 
         if action == "nav":
@@ -832,8 +1193,47 @@ class LauncherWindow(Gtk.Window):
                 self.controller.copy_path(project)
                 return True
             return False
-        if keyval in (Gdk.KEY_r, Gdk.KEY_R):
-            self.controller.rescan()
+        if keyval == Gdk.KEY_r:
+            # Ctrl+R (no Shift) from the main search mode: prefer a
+            # targeted root rescan when a relevant project path is known
+            # (the selected project, or the last opened one); fall back
+            # to a global rescan otherwise. The rescan utility row in the
+            # search list intentionally does not have a `.project`
+            # attribute, so it cleanly falls through to the global
+            # rescan path.
+            try:
+                if self.mode == MODE_SEARCH:
+                    row = self.listbox.get_selected_row()
+                    proj = getattr(row, "project", None)
+                    target = None
+                    if proj:
+                        target = proj.get("path", "")
+                    else:
+                        # fall back to last known project path
+                        last = getattr(self, "_last_project", None)
+                        if last:
+                            target = last.get("path", "")
+                    if target:
+                        root = self.controller._root_for_path(target)
+                        if root:
+                            self.controller.rescan_root(root)
+                            self._update_footer()
+                            return True
+                elif self.mode == MODE_ACTIONS and self._last_project:
+                    root = self.controller._root_for_path(
+                        self._last_project.get("path", ""))
+                    if root:
+                        self.controller.rescan_root(root)
+                        self._update_footer()
+                        return True
+            except Exception:
+                pass
+            self.controller.rescan_all()
+            self._update_footer()
+            return True
+        if keyval == Gdk.KEY_R:
+            # Ctrl+Shift+R -> always global rescan (all configured roots)
+            self.controller.rescan_all()
             self._update_footer()
             return True
         if keyval in (Gdk.KEY_j, Gdk.KEY_J):
@@ -859,10 +1259,38 @@ class LauncherWindow(Gtk.Window):
             self.set_mode(MODE_ACTIONS)
             self.rebuild()
             self.listbox.grab_focus()
+        elif self.mode == MODE_ACTIONS:
+            # cycle forward into the tool picker when it is available
+            if self._open_picker():
+                return
+            self.set_mode(MODE_SEARCH)
+            self.rebuild()
+            self.entry.grab_focus()
         else:
             self.set_mode(MODE_SEARCH)
             self.rebuild()
             self.entry.grab_focus()
+
+    def _open_picker(self):
+        """Enter the Open With picker for the selected project.
+
+        Returns False (without changing mode) when no registry tools are
+        installed, so Tab keeps its meaning instead of dead-ending.
+        """
+        project = self._last_project
+        if not project:
+            return False
+        try:
+            has_tools = bool(self.controller.picker_rows())
+        except Exception:
+            has_tools = False
+        if not has_tools:
+            return False
+        self._picker_project = project
+        self.set_mode(MODE_PICKER)
+        self.rebuild()
+        self.listbox.grab_focus()
+        return True
 
     def _move_selection(self, keyval):
         indices = self._selectable_indices()

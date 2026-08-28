@@ -36,7 +36,12 @@ def root_mtimes(roots):
 
 
 def scan(roots, max_depth=4):
-    """Scan roots for projects. Never raises."""
+    """Scan roots for projects. Never raises.
+
+    Only marker-based directories are discovered. Empty directories are
+    handled at the app layer via state preservation and targeted root
+    supplement, so library-level scans remain predictable for tests.
+    """
     result = ScanResult(scanned_at=time.time(), root_mtimes=root_mtimes(roots))
     seen_real = set()
     budget = {"dirs": 0}
@@ -48,6 +53,22 @@ def scan(roots, max_depth=4):
 
     result.projects.sort(key=lambda p: p["name"].lower())
     return result
+
+
+def scan_root(root, max_depth=4):
+    """Scan a single root for projects. Never raises.
+
+    Returns ScanResult with only projects under `root`.
+    """
+    return scan([root], max_depth=max_depth)
+
+
+def refresh_project(path):
+    """Refresh metadata for a single project path.
+
+    Returns project dict or None. Used for targeted project rescan.
+    """
+    return describe_project(path)
 
 
 def _scan_dir(path, depth, max_depth, seen_real, budget, result):
@@ -84,6 +105,39 @@ def _scan_dir(path, depth, max_depth, seen_real, budget, result):
 
 def _is_project_entries(entries):
     return any(markers.name_is_marker(entry.name) for entry in entries)
+
+
+def describe_project(path):
+    """Describe a single project path regardless of markers.
+
+    Returns project dict or None if path is not a directory or is ignored.
+    Handles generic/empty projects.
+    """
+    if not path or not os.path.isdir(path):
+        return None
+    basename = os.path.basename(os.path.normpath(path))
+    if markers.is_ignored_dir(basename):
+        return None
+    # Ignore hidden directories unless they contain markers? Keep consistent.
+    if basename.startswith(".") and not os.path.exists(os.path.join(path, ".git")):
+        # hidden dirs are ignored by markers logic; treat as not project unless is_git
+        return None
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return None
+    is_git = any(e.name == ".git" for e in entries)
+    kind = markers.detect(path)
+    return {
+        "path": path,
+        "name": basename or path,
+        "kind": kind.id,
+        "label": kind.label,
+        "icon": kind.icon,
+        "color": kind.color,
+        "is_git": is_git,
+        "cover": _cover.discover_cover(path),
+    }
 
 
 def _describe(path, entries):

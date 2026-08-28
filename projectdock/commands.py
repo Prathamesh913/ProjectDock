@@ -23,6 +23,20 @@ _LOCKFILES = (
     ("yarn.lock", "yarn"),
 )
 
+# Import intelligence package manager resolver to keep consistent; avoid circular import at runtime
+def _pm_runner_for_path(path):
+    try:
+        from . import intelligence as _intel
+        return _intel.detect_package_manager(path)[1]
+    except Exception:
+        # Fallback conservative: check lockfiles then npm
+        for lockfile, runner in _LOCKFILES:
+            if os.path.exists(os.path.join(path, lockfile)):
+                return f"{runner} run"
+        if os.path.exists(os.path.join(path, "package-lock.json")) or os.path.exists(os.path.join(path, "npm-shrinkwrap.json")):
+            return "npm run"
+        return "npm run"
+
 
 def discover(project):
     """Return up to a few (label, command) tuples for the project."""
@@ -52,7 +66,7 @@ def _node_commands(path, kind):
         runner = "deno task"
     else:
         scripts = _read_scripts(os.path.join(path, "package.json"), path)
-        runner = _package_runner(path)
+        runner = _pm_runner_for_path(path)
 
     out = []
     for name, script in scripts:
@@ -63,10 +77,7 @@ def _node_commands(path, kind):
 
 
 def _package_runner(path):
-    for lockfile, runner in _LOCKFILES:
-        if os.path.exists(os.path.join(path, lockfile)):
-            return f"{runner} run"
-    return "npm run"
+    return _pm_runner_for_path(path)
 
 
 def _read_scripts(pkg_path, path):

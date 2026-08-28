@@ -87,16 +87,37 @@ class Config:
 
     def available_editors(self):
         """Return list of detected editor argv lists present on system."""
+        # Prefer centralized registry but keep omarchy-launch-editor first
         out = []
         seen = set()
         for cmd in ("omarchy-launch-editor",):
             if shutil.which(cmd) and cmd not in seen:
                 out.append([cmd])
                 seen.add(cmd)
-        for name in KNOWN_EDITORS:
-            if shutil.which(name) and name not in seen:
-                out.append([name])
-                seen.add(name)
+        # Use tools registry for editors (deduplicates aliases like zed/zeditor)
+        try:
+            from . import tools as _tools
+            for tool in _tools.available_tools():
+                if tool.kind != "editor":
+                    continue
+                exe = _tools.resolve_executable(tool)
+                if exe:
+                    base = exe.split("/")[-1] if "/" in exe else tool.probe[0]
+                    # Use first probe name for display stability; avoid duplicates
+                    alias = tool.probe[0]
+                    if alias not in seen:
+                        out.append([alias])
+                        seen.add(alias)
+            # Fallback to legacy list for any editors not in registry (defensive)
+            for name in KNOWN_EDITORS:
+                if name not in seen and shutil.which(name):
+                    out.append([name])
+                    seen.add(name)
+        except Exception:
+            for name in KNOWN_EDITORS:
+                if name not in seen and shutil.which(name):
+                    out.append([name])
+                    seen.add(name)
         return out
 
     def editor_argv_for(self, preferred):
