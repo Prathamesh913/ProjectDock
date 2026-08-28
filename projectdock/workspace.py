@@ -9,11 +9,28 @@ never scan arbitrary processes, bounded refresh.
 """
 
 import os
+import re
 import time
 from dataclasses import dataclass, field, asdict
 import json
 
 from . import hyprland
+
+_TOOL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _sanitize_preferred_tool(entry):
+    """Drop malformed preferred_tool fields; keep sane ones.
+
+    Migration-safe: unknown/missing/corrupt values simply leave no
+    preference behind. The id is only shape-validated here; availability is
+    re-checked against the tool registry at read time.
+    """
+    pref = entry.get("preferred_tool")
+    if pref is None:
+        return
+    if not isinstance(pref, str) or not _TOOL_ID_RE.match(pref):
+        entry.pop("preferred_tool", None)
 
 @dataclass
 class WorkspaceEntry:
@@ -38,6 +55,10 @@ class WorkspaceStore:
             state.workspace = {}
         if not isinstance(state.workspace, dict):
             state.workspace = {}
+        # sanitize persisted preferred tools (migration-safe)
+        for entry in self._state.workspace.values():
+            if isinstance(entry, dict):
+                _sanitize_preferred_tool(entry)
 
     def _ensure_state(self):
         if self._state is None:
@@ -85,6 +106,8 @@ class WorkspaceStore:
                     continue
                 clean2[k] = fv
             entry["action_last_used"] = clean2
+        # keep preferred tool sane on every write as well
+        _sanitize_preferred_tool(entry)
 
     def _record_usage(self, path, action_id):
         if not path or not action_id:
@@ -137,6 +160,33 @@ class WorkspaceStore:
         self._record_usage(path, action)
         self._sanitize_usage(entry)
         # keep ephemeral windows untouched
+
+    def get_preferred_tool_id(self, path):
+        """Sanitized persisted tool id for a project, or empty string.
+
+        Shape-validated only; callers re-validate availability against the
+        tool registry so an uninstalled tool is never launched.
+        """
+        self._ensure_state()
+        entry = self._state.workspace.get(path, {}) if hasattr(self._state, "workspace") else {}
+        if not isinstance(entry, dict):
+            return ""
+        pref = entry.get("preferred_tool")
+        if isinstance(pref, str) and _TOOL_ID_RE.match(pref):
+            return pref
+        return ""
+
+    def set_preferred_tool(self, path, tool_id):
+        """Remember which tool the user explicitly chose for a project."""
+        if not path or not isinstance(tool_id, str) or not _TOOL_ID_RE.match(tool_id):
+            return
+        self._ensure_state()
+        entry = self._state.workspace.get(path)
+        if not isinstance(entry, dict):
+            entry = {"path": path}
+        entry["preferred_tool"] = tool_id
+        entry["path"] = path
+        self._state.workspace[path] = entry
 
     def get_preferred_editor(self, path):
         self._ensure_state()

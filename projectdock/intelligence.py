@@ -26,6 +26,9 @@ class Capability:
     label: str  # human label shown in menu
     command: str  # shell command to run in terminal cwd
     script: str = ""  # underlying script name for tracing
+    available: bool = True  # whether required executable is installed
+    pm: str = ""  # package manager for node caps (npm/pnpm/yarn/bun) or ""
+    long_running: bool = False  # dev/serve/start/run are typically long-running
 
 @dataclass
 class ProjectCapabilities:
@@ -95,7 +98,11 @@ def invalidate(path=None):
 
 # ------------------------------------------------------------
 # Node
-_NODE_WATCHED = ["package.json", "deno.json", "deno.jsonc", "bun.lockb", "bun.lock", "pnpm-lock.yaml", "yarn.lock"]
+_NODE_WATCHED = [
+    "package.json", "deno.json", "deno.jsonc",
+    "package-lock.json", "npm-shrinkwrap.json",
+    "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock",
+]
 
 _DEV_PRIORITY = ["dev", "start:dev", "serve", "start"]
 _TEST_PRIORITY = ["test", "test:unit", "test:e2e", "e2e"]
@@ -103,12 +110,110 @@ _BUILD_PRIORITY = ["build", "build:prod", "compile"]
 
 _DANGEROUS_SCRIPTS = {"preinstall", "postinstall", "preuninstall", "postuninstall", "install"}
 
-def _package_runner(path):
-    # must stay consistent with commands.py
-    for lock, runner in (("bun.lockb","bun"),("bun.lock","bun"),("pnpm-lock.yaml","pnpm"),("yarn.lock","yarn")):
+# Package manager detection priority as per spec
+_KNOWN_PMS = ("npm", "pnpm", "yarn", "bun")
+
+_LOCK_PM_MAP = {
+    "package-lock.json": "npm",
+    "npm-shrinkwrap.json": "npm",
+    "pnpm-lock.yaml": "pnpm",
+    "yarn.lock": "yarn",
+    "bun.lockb": "bun",
+    "bun.lock": "bun",
+}
+
+# Lock check order for conflicting evidence: deterministic.
+# Order rationale: when multiple lockfiles coexist (a stale bun.lock left
+# over from a previous experiment, but the project actually runs with npm),
+# the authoritative npm lockfile wins, and stale bun.lock files do not
+# dominate. We then prefer non-npm pm lockfiles over the npm fallback, but
+# never over package-lock.json itself.
+_LOCK_CHECK_ORDER = [
+    "package-lock.json", "npm-shrinkwrap.json",
+    "pnpm-lock.yaml", "yarn.lock",
+    "bun.lockb", "bun.lock",
+]
+
+import shutil as _shutil
+
+def _package_manager_from_field(path):
+    """Return pm string from packageManager field if valid, else None."""
+    try:
+        with open(os.path.join(path, "package.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    pm = data.get("packageManager")
+    if not isinstance(pm, str) or not pm.strip():
+        return None
+    # packageManager format e.g. "npm@10.2.3" "pnpm@9.0.0" "yarn@4.0.0" "bun@1.0.0"
+    pm = pm.strip().lower()
+    # Extract before @
+    base = pm.split("@")[0].strip()
+    # Some projects use "yarn@..." or "yarn classic"? Keep simple
+    # Validate base is known pm; also handle "yarn" vs "yarn@berry"
+    for known in _KNOWN_PMS:
+        if base == known or base.startswith(known):
+            return known
+    return None
+
+def _package_manager_from_lockfiles(path):
+    for lock in _LOCK_CHECK_ORDER:
         if os.path.exists(os.path.join(path, lock)):
-            return f"{runner} run"
+            return _LOCK_PM_MAP[lock]
+    return None
+
+def _fallback_package_manager():
+    """Pick the most preferred package manager that is actually installed.
+
+    Precedence is npm > pnpm > yarn > bun, restricted to executables that
+    exist on the current system. Crucially: this routine MUST NOT silently
+    invent a pm that is not installed. A stale `bun.lock` (or no evidence at
+    all) on a machine without `npm` should not blindly pick `bun`; we only
+    return a pm whose executable is on PATH.
+    """
+    for pm in ("npm", "pnpm", "yarn", "bun"):
+        if _shutil.which(pm) is not None:
+            return pm
+    # Nothing installed: explicitly signal "no pm". Callers that need a
+    # default (capability detection) should mark capabilities unavailable
+    # rather than fabricate a non-existent runtime.
+    return None
+
+def _pm_runner(pm):
+    if pm in ("bun", "pnpm", "yarn"):
+        return f"{pm} run"
     return "npm run"
+
+def _is_pm_available(pm):
+    if not pm:
+        return False
+    try:
+        return _shutil.which(pm) is not None
+    except Exception:
+        return False
+
+def detect_package_manager(path):
+    """Public: detect package manager for a node project.
+
+    Returns (pm_name, runner, available_bool, source).
+    source is one of "packageManager", "lockfile", "fallback", or "none".
+    pm_name is "" when no safe determination is possible.
+    """
+    pm_field = _package_manager_from_field(path)
+    if pm_field:
+        return (pm_field, _pm_runner(pm_field), _is_pm_available(pm_field), "packageManager")
+    pm_lock = _package_manager_from_lockfiles(path)
+    if pm_lock:
+        return (pm_lock, _pm_runner(pm_lock), _is_pm_available(pm_lock), "lockfile")
+    pm_fb = _fallback_package_manager()
+    if pm_fb:
+        return (pm_fb, _pm_runner(pm_fb), True, "fallback")
+    return ("", "npm run", False, "none")
+
+def _package_runner(path):
+    pm, runner, _, _ = detect_package_manager(path)
+    return runner
 
 def _read_scripts_safe(path, pkg_name):
     try:
@@ -152,17 +257,17 @@ def _detect_node(path):
     if not scripts:
         # also try deno.json fallback if package.json absent but deno kind handled separately
         return ProjectCapabilities(path=path)
-    runner = _package_runner(path)
+    pm, runner, available, _src = detect_package_manager(path)
     caps = {}
     dev_name = _pick_script(scripts, _DEV_PRIORITY)
     if dev_name:
-        caps["dev"] = Capability(key="dev", label="Run Dev Server", command=f"{runner} {dev_name}", script=dev_name)
+        caps["dev"] = Capability(key="dev", label="Run Dev Server", command=f"{runner} {dev_name}", script=dev_name, available=available, pm=pm, long_running=True)
     test_name = _pick_script(scripts, _TEST_PRIORITY)
     if test_name:
-        caps["test"] = Capability(key="test", label="Run Tests", command=f"{runner} {test_name}", script=test_name)
+        caps["test"] = Capability(key="test", label="Run Tests", command=f"{runner} {test_name}", script=test_name, available=available, pm=pm, long_running=False)
     build_name = _pick_script(scripts, _BUILD_PRIORITY)
     if build_name:
-        caps["build"] = Capability(key="build", label="Build Project", command=f"{runner} {build_name}", script=build_name)
+        caps["build"] = Capability(key="build", label="Build Project", command=f"{runner} {build_name}", script=build_name, available=available, pm=pm, long_running=False)
     # limit: at most dev/test/build
     return ProjectCapabilities(path=path, capabilities=caps)
 
@@ -170,16 +275,17 @@ def _detect_deno(path):
     for fname in ("deno.json", "deno.jsonc"):
         scripts = _read_scripts_safe(path, fname)
         if scripts:
+            avail = _has_executable("deno")
             caps = {}
             dev_name = _pick_script(scripts, _DEV_PRIORITY)
             if dev_name:
-                caps["dev"] = Capability(key="dev", label="Run Dev Server", command=f"deno task {dev_name}", script=dev_name)
+                caps["dev"] = Capability(key="dev", label="Run Dev Server", command=f"deno task {dev_name}", script=dev_name, available=avail, long_running=True)
             test_name = _pick_script(scripts, _TEST_PRIORITY)
             if test_name:
-                caps["test"] = Capability(key="test", label="Run Tests", command=f"deno task {test_name}", script=test_name)
+                caps["test"] = Capability(key="test", label="Run Tests", command=f"deno task {test_name}", script=test_name, available=avail, long_running=False)
             build_name = _pick_script(scripts, _BUILD_PRIORITY)
             if build_name:
-                caps["build"] = Capability(key="build", label="Build Project", command=f"deno task {build_name}", script=build_name)
+                caps["build"] = Capability(key="build", label="Build Project", command=f"deno task {build_name}", script=build_name, available=avail, long_running=False)
             return ProjectCapabilities(path=path, capabilities=caps)
     return ProjectCapabilities(path=path)
 
@@ -187,13 +293,20 @@ def _detect_deno(path):
 # Python
 _PY_WATCHED = ["pyproject.toml", "requirements.txt", "setup.py", "manage.py", "Pipfile"]
 
+def _has_executable(name):
+    try:
+        return _shutil.which(name) is not None
+    except Exception:
+        return False
+
 def _detect_python(path):
     caps = {}
     has_manage = os.path.exists(os.path.join(path, "manage.py"))
     if has_manage:
+        avail = _has_executable("python") or _has_executable("python3")
         # Django project - strong evidence
-        caps["dev"] = Capability(key="dev", label="Run Dev Server", command="python manage.py runserver", script="manage.py runserver")
-        caps["test"] = Capability(key="test", label="Run Tests", command="python manage.py test", script="manage.py test")
+        caps["dev"] = Capability(key="dev", label="Run Dev Server", command="python manage.py runserver", script="manage.py runserver", available=avail, long_running=True)
+        caps["test"] = Capability(key="test", label="Run Tests", command="python manage.py test", script="manage.py test", available=avail, long_running=False)
         return ProjectCapabilities(path=path, capabilities=caps)
 
     # pyproject inspection (safe, no toml dep: read as text heuristics)
@@ -212,12 +325,14 @@ def _detect_python(path):
         # very lightweight heuristic: look for pytest markers
         lower = text.lower()
         if "pytest" in lower or "[tool.pytest" in lower or "[tool.pytest.ini_options]" in lower:
-            caps["test"] = Capability(key="test", label="Run Tests", command="pytest", script="pytest")
+            avail = _has_executable("pytest") or _has_executable("python") or _has_executable("python3")
+            caps["test"] = Capability(key="test", label="Run Tests", command="pytest", script="pytest", available=avail, long_running=False)
         elif has_requirements or has_pyproject:
             # if we can't detect pytest but it's a python project, we still don't invent test
             pass
         if "[build-system]" in text or "build-system" in lower:
-            caps["build"] = Capability(key="build", label="Build Package", command="python -m build", script="build")
+            avail = _has_executable("python") or _has_executable("python3")
+            caps["build"] = Capability(key="build", label="Build Package", command="python -m build", script="build", available=avail, long_running=False)
         elif "setup.py" in lower or has_pyproject:
             # don't add build unless build-system present - keep conservative
             pass
@@ -238,19 +353,21 @@ _CMAKE_WATCHED = ["CMakeLists.txt", "meson.build"]
 def _detect_rust(path):
     if not os.path.exists(os.path.join(path, "Cargo.toml")):
         return ProjectCapabilities(path=path)
+    avail = _has_executable("cargo")
     return ProjectCapabilities(path=path, capabilities={
-        "run": Capability(key="run", label="Run Project", command="cargo run", script="cargo run"),
-        "test": Capability(key="test", label="Run Tests", command="cargo test", script="cargo test"),
-        "build": Capability(key="build", label="Build Project", command="cargo build", script="cargo build"),
+        "run": Capability(key="run", label="Run Project", command="cargo run", script="cargo run", available=avail, long_running=True),
+        "test": Capability(key="test", label="Run Tests", command="cargo test", script="cargo test", available=avail, long_running=False),
+        "build": Capability(key="build", label="Build Project", command="cargo build", script="cargo build", available=avail, long_running=False),
     })
 
 def _detect_go(path):
     if not os.path.exists(os.path.join(path, "go.mod")):
         return ProjectCapabilities(path=path)
+    avail = _has_executable("go")
     return ProjectCapabilities(path=path, capabilities={
-        "run": Capability(key="run", label="Run Project", command="go run .", script="go run ."),
-        "test": Capability(key="test", label="Run Tests", command="go test ./...", script="go test ./..."),
-        "build": Capability(key="build", label="Build Project", command="go build ./...", script="go build ./..."),
+        "run": Capability(key="run", label="Run Project", command="go run .", script="go run .", available=avail, long_running=True),
+        "test": Capability(key="test", label="Run Tests", command="go test ./...", script="go test ./...", available=avail, long_running=False),
+        "build": Capability(key="build", label="Build Project", command="go build ./...", script="go build ./...", available=avail, long_running=False),
     })
 
 _MAKE_SAFE = {"run", "test", "build", "dev"}
@@ -271,17 +388,18 @@ def _detect_make(path):
     except OSError:
         return ProjectCapabilities(path=path)
     found = set(_MAKE_RE.findall(content))
+    avail = _has_executable("make")
     caps = {}
     if "run" in found:
-        caps["run"] = Capability(key="run", label="Run Project", command="make run", script="make run")
+        caps["run"] = Capability(key="run", label="Run Project", command="make run", script="make run", available=avail, long_running=True)
     if "test" in found:
-        caps["test"] = Capability(key="test", label="Run Tests", command="make test", script="make test")
+        caps["test"] = Capability(key="test", label="Run Tests", command="make test", script="make test", available=avail, long_running=False)
     if "build" in found:
-        caps["build"] = Capability(key="build", label="Build Project", command="make build", script="make build")
+        caps["build"] = Capability(key="build", label="Build Project", command="make build", script="make build", available=avail, long_running=False)
     if "dev" in found and "dev" not in caps:
         # dev as run dev server alternative
         if "run" not in caps:
-            caps["dev"] = Capability(key="dev", label="Run Dev Server", command="make dev", script="make dev")
+            caps["dev"] = Capability(key="dev", label="Run Dev Server", command="make dev", script="make dev", available=avail, long_running=True)
     # if only generic 'make' without specific targets, expose a conservative 'make'?
     # Keep conservative: only if above none found, don't expose bare 'make' to avoid side effects
     return ProjectCapabilities(path=path, capabilities=caps)
@@ -289,8 +407,9 @@ def _detect_make(path):
 def _detect_cmake(path):
     if not (os.path.exists(os.path.join(path, "CMakeLists.txt")) or os.path.exists(os.path.join(path, "meson.build"))):
         return ProjectCapabilities(path=path)
+    avail = _has_executable("cmake")
     return ProjectCapabilities(path=path, capabilities={
-        "build": Capability(key="build", label="Build Project", command="cmake --build build", script="cmake --build build"),
+        "build": Capability(key="build", label="Build Project", command="cmake --build build", script="cmake --build build", available=avail, long_running=False),
     })
 
 # ------------------------------------------------------------
