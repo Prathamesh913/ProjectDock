@@ -47,6 +47,64 @@ class WorkspaceStore:
         self._state = state
         self._ephemeral_active = {}  # path -> list of client dicts
         self._last_refresh = 0.0
+        self._refresh_generation = 0  # monotonic counter to detect stale results
+        self._refresh_in_flight = False  # guard against concurrent refresh threads
+
+    # ---- split refresh (collect off-thread, apply on main thread) ----
+
+    def collect(self, projects):
+        """Collect workspace data off the GTK thread. Safe to call from background.
+
+        Returns a result dict consumed by :meth:`apply`. Does NOT mutate
+        any instance state — all expensive I/O lives here.
+        """
+        clients = hyprland.clients()
+        if not clients:
+            return {"generation": self._refresh_generation,
+                    "assoc": {}, "projects": projects}
+        assoc = hyprland.associate_clients_to_projects(clients, projects)
+        known_paths = {p.get("path") for p in projects}
+        filtered = {k: v for k, v in assoc.items() if k in known_paths}
+        return {"generation": self._refresh_generation,
+                "assoc": filtered, "projects": projects}
+
+    def apply(self, result, state=None):
+        """Apply collected workspace result on the GTK thread.
+
+        Ignores stale results (generation mismatch) and silently skips
+        if a newer refresh was started after this one was collected.
+        """
+        if result is None:
+            return
+        gen = result.get("generation", -1)
+        if gen != self._refresh_generation:
+            # A newer collect was started — discard this stale result.
+            return
+        self._last_refresh = time.time()
+        filtered = result.get("assoc", {})
+        self._ephemeral_active = filtered
+        # update last_active_at for active projects (touch)
+        now = time.time()
+        for path in filtered:
+            self._ensure_state()
+            entry = self._state.workspace.get(path, {}) if hasattr(self._state, "workspace") else {}
+            if not isinstance(entry, dict):
+                entry = {}
+            entry["last_active_at"] = max(float(entry.get("last_active_at", 0)), now)
+            entry["path"] = path
+            if hasattr(self._state, "workspace"):
+                self._state.workspace[path] = entry
+        self._refresh_in_flight = False
+
+    def start_refresh(self):
+        """Mark that a new refresh generation has begun.
+
+        Returns the new generation number. ``collect()`` must use this
+        value so ``apply()`` can discard stale results.
+        """
+        self._refresh_generation += 1
+        self._refresh_in_flight = True
+        return self._refresh_generation
 
     def load_from_state(self, state):
         self._state = state
@@ -302,6 +360,9 @@ class WorkspaceStore:
 
         Bounded, safe, never raises. Updates ephemeral map and validates stale entries.
         Should be called when launcher opens or on explicit rescan.
+
+        This is the synchronous path — prefer :meth:`collect` + :meth:`apply`
+        for the launcher show path to avoid blocking the GTK main thread.
         """
         self._last_refresh = time.time()
         clients = hyprland.clients()

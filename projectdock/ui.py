@@ -144,6 +144,7 @@ class LauncherWindow(Gtk.Window):
         self._cover_cache = {}
         self._picker_project = None
         self._picker_filter = "all"
+        self._rebuild_timeout = None
 
         self.add_css_class("dock")
         self.set_resizable(False)
@@ -261,6 +262,7 @@ class LauncherWindow(Gtk.Window):
     def _on_destroyed(self, *args):
         _trace("destroy: window destroyed")
         self._cancel_git_timeout()
+        self._cancel_search_rebuild()
         self._stop_monitors()
 
     def _metrics(self):
@@ -285,17 +287,22 @@ class LauncherWindow(Gtk.Window):
         # Lightweight root signature check when showing: if roots changed or mtime out-of-date, rescan will be triggered via controller._maybe_rescan
         # Also start directory monitors while visible
         self._start_monitors()
-        self.rebuild()
+        # Present FIRST so the compositor sees the surface immediately,
+        # then rebuild the list on the next idle cycle to avoid blocking
+        # the first frame.
         self.present()
-        GLib.idle_add(self._grab_entry)
+        GLib.idle_add(self._show_dock_idle)
 
-    def _grab_entry(self):
+    def _show_dock_idle(self):
+        """Rebuild the list and grab focus after the first frame is painted."""
+        self.rebuild()
         self.entry.grab_focus()
         return GLib.SOURCE_REMOVE
 
     def hide_dock(self):
         _trace("hide_dock: called (esc/toggle)")
         self._cancel_git_timeout()
+        self._cancel_search_rebuild()
         self._stop_monitors()
         self.controller.hide_window()
 
@@ -837,7 +844,24 @@ class LauncherWindow(Gtk.Window):
         if self._resetting:
             return
         if self.mode == MODE_SEARCH:
+            self._schedule_search_rebuild()
+
+    def _schedule_search_rebuild(self):
+        """Debounce rapid keystrokes: coalesce into one rebuild after 30ms."""
+        self._cancel_search_rebuild()
+        self._rebuild_timeout = GLib.timeout_add(
+            30, self._run_scheduled_rebuild)
+
+    def _cancel_search_rebuild(self):
+        if self._rebuild_timeout is not None:
+            GLib.source_remove(self._rebuild_timeout)
+            self._rebuild_timeout = None
+
+    def _run_scheduled_rebuild(self):
+        self._rebuild_timeout = None
+        if self.mode == MODE_SEARCH and self.get_visible():
             self.rebuild()
+        return GLib.SOURCE_REMOVE
 
     def _on_row_activated(self, listbox, row):
         if self.mode == MODE_PICKER:

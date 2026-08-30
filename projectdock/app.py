@@ -52,6 +52,12 @@ class DockApp(Gtk.Application):
         self.workspace = workspace.WorkspaceStore(self.state)
         self.workspace.load_from_state(self.state)
         self.sessions = sessions.SessionStore()
+        # Async workspace refresh tracking
+        self._workspace_refresh_thread = None
+        # Annotation cache: avoids re-annotating on every keystroke.
+        # Only invalidated when project list / pins / recents change.
+        self._annotation_cache = None  # (version_key, annotated_list)
+        self._annotation_version = 0  # bumped on state changes
 
     # ------------------------------------------------------------- gtk app
 
@@ -121,17 +127,51 @@ class DockApp(Gtk.Application):
 
     def _show(self):
         self._ensure_window()
-        # refresh workspace awareness when launcher opens (bounded, safe)
-        try:
-            # use current known projects for association
-            self.workspace.refresh(self.state.projects)
-            self.workspace.cleanup_stale(self.state.projects)
-        except Exception:
-            pass
+        # Show window immediately from cached state — no blocking I/O.
         self.window.show_dock()
         self._shown_at = time.monotonic()
         self._start_focus_poll()
+        # Refresh workspace awareness asynchronously so the UI is not
+        # blocked by hyprctl or /proc reads.
+        self._refresh_workspace_async()
         self._maybe_rescan()
+
+    # ---- async workspace refresh ----
+
+    def _refresh_workspace_async(self):
+        """Kick off a background workspace refresh. Guards against storms.
+
+        At most one refresh thread runs at a time. If a refresh is
+        already in flight we bump the generation so the in-flight
+        result is discarded when it arrives, and start a fresh one.
+        """
+        if self.workspace._refresh_in_flight:
+            # Bump generation so the in-flight result is stale.
+            self.workspace.start_refresh()
+        gen = self.workspace.start_refresh()
+        projects = list(self.state.projects)
+        def _bg():
+            try:
+                result = self.workspace.collect(projects)
+            except Exception:
+                result = None
+            GLib.idle_add(self._apply_workspace_refresh, result, gen)
+        self._workspace_refresh_thread = threading.Thread(
+            target=_bg, daemon=True)
+        self._workspace_refresh_thread.start()
+
+    def _apply_workspace_refresh(self, result, gen):
+        """Apply async workspace result on the GTK main thread."""
+        # Discard if generation moved on (a newer refresh started).
+        if gen != self.workspace._refresh_generation:
+            return GLib.SOURCE_REMOVE
+        self.workspace.apply(result)
+        self.workspace.cleanup_stale(self.state.projects)
+        self.invalidate_annotation()
+        # Rebuild UI to reflect updated active/focus state
+        if self.window is not None and self.window.get_visible():
+            self.window.rebuild()
+        return GLib.SOURCE_REMOVE
 
     def _start_focus_poll(self):
         if self._focus_poll is not None:
@@ -161,15 +201,32 @@ class DockApp(Gtk.Application):
     # ------------------------------------------------------------- project list
 
     def projects_for_query(self, query):
+        annotated = self._get_annotated_projects()
+        if query:
+            return search.filter_and_rank(query, annotated)
+        return search.sorted_by_activity(annotated)
+
+    def _get_annotated_projects(self):
+        """Return annotated project list, using cache when inputs unchanged."""
+        ver = self._annotation_version
+        cached = self._annotation_cache
+        if cached is not None and cached[0] == ver:
+            return cached[1]
+        # Rebuild from scratch
         projects = [dict(p) for p in self.state.projects]
         self.state.annotate(projects)
         try:
             self.workspace.annotate_projects(projects)
         except Exception:
             pass
-        if query:
-            return search.filter_and_rank(query, projects)
-        return search.sorted_by_activity(projects)
+        self._annotation_cache = (ver, projects)
+        return projects
+
+    def invalidate_annotation(self):
+        """Mark annotation cache as stale. Call after project list / pins /
+        recents / workspace state changes."""
+        self._annotation_version += 1
+        self._annotation_cache = None
 
     def project_count(self):
         return len(self.state.projects)
@@ -331,6 +388,7 @@ class DockApp(Gtk.Application):
             # project not yet in cache (maybe generic empty not yet scanned) -> append
             self.state.projects.append(new_desc)
             self.state.projects.sort(key=lambda p: p.get("name","").lower())
+        self.invalidate_annotation()
         state.save(self.state)
         if self.window is not None:
             self.window.rebuild()
@@ -451,6 +509,7 @@ class DockApp(Gtk.Application):
         except Exception:
             self.state.update_projects(
                 result.projects, result.scanned_at, result.root_mtimes)
+        self.invalidate_annotation()
         state.save(self.state)
         # Replace transient "Rescanning…" with a brief confirmation that
         # auto-clears so the footer returns to its normal hints. A monitor-
@@ -514,10 +573,12 @@ class DockApp(Gtk.Application):
                 self.workspace.cleanup_stale(self.state.projects)
             except Exception:
                 pass
+            self.invalidate_annotation()
             state.save(self.state)
         except Exception:
             # fallback to full rescan
             self.state.update_projects(result.projects, result.scanned_at, result.root_mtimes)
+            self.invalidate_annotation()
             state.save(self.state)
         # Replace transient "Rescanning…" with a brief confirmation that
         # auto-clears so the footer returns to its normal hints. Use the
@@ -593,6 +654,7 @@ class DockApp(Gtk.Application):
             self.state.scanned_at = time.time()
         except Exception:
             pass
+        self.invalidate_annotation()
         state.save(self.state)
         # Invalidate caches for new project
         intelligence.invalidate(path)
@@ -1015,6 +1077,15 @@ class DockApp(Gtk.Application):
         except Exception:
             pass
         self._touch(project)
+        # Check for a validated preferred tool first (e.g. Zed, VS Code)
+        try:
+            tool = self.preferred_tool_for(project)
+            if tool is not None:
+                self._record_workspace(project, action=f"tool:{tool.id}")
+                self.launch_tool(project, tool.id)
+                return
+        except Exception:
+            pass
         # per-project preferred editor
         pref = ""
         try:
@@ -1077,6 +1148,13 @@ class DockApp(Gtk.Application):
             if self.focus_project(project):
                 return
             self.open_default(project)
+            return
+        if action_id.startswith("tool:"):
+            tool_id = action_id.split(":", 1)[1]
+            self._touch(project)
+            if not self.launch_tool(project, tool_id):
+                # Tool unavailable or launch failed — fall through to default.
+                self.open_default(project)
             return
         if action_id.startswith("editor:"):
             base = action_id.split(":", 1)[1]
@@ -1222,6 +1300,7 @@ class DockApp(Gtk.Application):
             self.state.unpin(path)
         else:
             self.state.pin(path)
+        self.invalidate_annotation()
         state.save(self.state)
 
     def open_config(self):
@@ -1241,6 +1320,7 @@ class DockApp(Gtk.Application):
 
     def _touch(self, project):
         self.state.touch_recent(project["path"])
+        self.invalidate_annotation()
         state.save(self.state)
 
     def quit(self):
